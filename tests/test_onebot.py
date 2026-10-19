@@ -68,3 +68,22 @@ async def test_bot_sends_agent_reply_to_original_user():
     assert sent == [
         {"action": "send_private_msg", "params": {"user_id": 123, "message": "你好呀"}}
     ]
+
+
+@pytest.mark.asyncio
+async def test_bot_ignores_users_outside_allowlist():
+    class UnexpectedAgent:
+        async def reply(self, user_id, text):
+            pytest.fail("Blocked users must not reach the agent")
+
+    async def unexpected_send(action):
+        pytest.fail("Blocked users must not receive a reply")
+
+    bot = OneBotPrivateBot(
+        UnexpectedAgent(), self_id=999, send_action=unexpected_send,
+        allowed_users=frozenset({456}),
+    )
+    await bot.handle_event({
+        "post_type": "message", "message_type": "private",
+        "user_id": 123, "raw_message": "hello",
+    })
