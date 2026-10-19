@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -16,7 +17,7 @@ DEFAULT_PERSONA = "你是一个正在使用 QQ 私聊的朋友。说话自然、
 
 @dataclass(frozen=True)
 class AgentResponse:
-    """统一两种输出格式；缺失的情绪值不覆盖旧状态，daze_time 暂不参与调度。"""
+    """统一回复与等待决策；wait_seconds 触发重评估，daze_time 仅兼容旧格式。"""
 
     reply: bool
     text: str | None = None
@@ -24,6 +25,8 @@ class AgentResponse:
     positive: float | None = None
     excitement: float | None = None
     daze_time: float | None = None
+    messages: tuple[str, ...] = ()
+    wait_seconds: float | None = None
 
 
 @dataclass
@@ -79,15 +82,34 @@ def parse_ai_response(response_text: str) -> AgentResponse:
     except ValueError:
         return _parse_legacy_response(response_text)
     if data.get("reply") is not True:
+        if data.get("action") == "wait":
+            delay = _optional_float(data.get("wait_seconds"))
+            if delay is None or not math.isfinite(delay) or delay <= 0:
+                raise ValueError("wait_seconds 必须是有限的正数")
+            return AgentResponse(reply=False, wait_seconds=delay)
         # 仅接受 JSON 布尔值 true，避免把字符串 "false" 当成需要回复。
         return AgentResponse(reply=False, daze_time=_optional_float(data.get("daze_time")))
 
-    text = data.get("text")
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("reply=true 时必须提供非空 text")
+    parts: list[str] = []
+    if "messages" in data:
+        messages = data["messages"]
+        if not isinstance(messages, list) or not all(isinstance(item, str) for item in messages):
+            raise ValueError("messages 必须是字符串数组")
+        parts = [item.strip() for item in messages if item.strip()]
+        if not parts:
+            raise ValueError("messages 必须包含非空文本")
+        # 超出的分段并入最后一条，限制气泡数但不丢失回复内容。
+        if len(parts) > 4:
+            parts = parts[:3] + ["\n".join(parts[3:])]
+        text = "\n".join(parts)
+    else:
+        text = data.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("reply=true 时必须提供非空 text")
     return AgentResponse(
         reply=True,
         text=text.strip(),
+        messages=tuple(parts),
         mood=str(data.get("mood", "")),
         positive=_clamp(data.get("positive")),
         excitement=_clamp(data.get("excitement")),
@@ -137,30 +159,58 @@ class HumanlikeAgent:
         self._sessions: dict[int, SessionState] = {}
         self._session_locks: dict[int, asyncio.Lock] = {}
 
-    async def reply(self, user_id: int, user_message: str) -> str | None:
-        """返回回复文本或 None；同一用户串行生成，不阻塞其他用户。"""
+    async def reply(self, user_id: int, user_message: str) -> str | list[str] | None:
+        """返回单条文本、分段列表或 None；同一用户串行生成，不阻塞其他用户。"""
         lock = self._session_locks.setdefault(user_id, asyncio.Lock())
         async with lock:
             return await self._reply_locked(user_id, user_message)
 
-    async def _reply_locked(self, user_id: int, user_message: str) -> str | None:
+    async def _reply_locked(self, user_id: int, user_message: str) -> str | list[str] | None:
         """在持有用户锁时生成回复，并更新该用户的历史和情绪。"""
         state = self._sessions.setdefault(user_id, SessionState())
         now = datetime.now().strftime("%Y.%m.%d.%H:%M:%S")
         messages = self._build_messages(state, now, user_message)
         response = parse_ai_response(await self._generate(messages))
+        if response.wait_seconds is None:
+            parts = list(response.messages) or ([response.text] if response.text else [])
+            self.remember(user_id, user_message, response, parts)
+        if not response.reply:
+            return None
+        return list(response.messages) if response.messages else response.text
 
-        # 生成或解析失败时不写入历史；主动沉默则仍记录本次用户消息。
+    async def decide(
+        self, user_id: int, user_message: str, *, allow_wait: bool = True,
+        input_context: str = "",
+    ) -> AgentResponse:
+        """只生成决策，不修改历史；过时结果可以安全丢弃。"""
+        lock = self._session_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            state = self._sessions.setdefault(user_id, SessionState())
+            now = datetime.now().strftime("%Y.%m.%d.%H:%M:%S")
+            messages = self._build_messages(state, now, user_message)
+            if input_context:
+                messages[-1]["content"] += f"\n输入节奏：{input_context}"
+            if not allow_wait:
+                messages[0]["content"] += (
+                    "本轮等待预算已用尽，请根据已有内容回复或保持沉默，不要再输出 wait。"
+                )
+            return parse_ai_response(await self._generate(messages))
+
+    def remember(
+        self, user_id: int, user_message: str, response: AgentResponse, sent: list[str]
+    ) -> None:
+        """记录已处理的输入和实际发出的气泡，未发送的候选内容不进入历史。"""
+        state = self._sessions.setdefault(user_id, SessionState())
+        now = datetime.now().strftime("%Y.%m.%d.%H:%M:%S")
         state.history.append(f"{now}[用户]'{user_message}'")
-        if response.reply and response.text:
-            reply_time = datetime.now().strftime("%Y.%m.%d.%H:%M:%S")
-            state.history.append(f"{reply_time}[我]'{response.text}'")
+        if sent:
+            text = "\n".join(sent)
+            state.history.append(f"{now}[我]'{text}'")
             if response.positive is not None:
                 state.positive = response.positive
             if response.excitement is not None:
                 state.excitement = response.excitement
         state.history = state.history[-self._max_history_items :]
-        return response.text if response.reply else None
 
     def _build_messages(
         self, state: SessionState, now: str, user_message: str
@@ -180,8 +230,16 @@ class HumanlikeAgent:
                 "content": (
                     f"{self._persona}\n"
                     "输出 JSON："
-                    '{"reply":true,"mood":"心情","text":"回复",'
+                    '{"reply":true,"mood":"心情","messages":["第一条消息","第二条消息"],'
                     '"positive":0.0,"excitement":0.0}。'
+                    "messages 是按语义自然分段的 1 到 4 条 QQ 消息。"
+                    "需要展开时可以多说几句，分成几个气泡；简短回应只发一条，不要凑数。"
+                    "不要机械地逐标点拆句，每条消息可以包含多个句子。"
+                    "用户消息可能由连续几个气泡合并而成。结合语义和上下文判断是否说完，"
+                    "不要仅凭标点判断。明确提问、结束语或简短寒暄应及时回应；"
+                    "明显的铺垫、未完的话或承接词可以继续听。"
+                    '若需要等用户补充，输出 {"action":"wait","wait_seconds":1.5}，'
+                    "按语境选择 0.5 到 3 秒，不要对每条消息都等待。"
                     '如果不回复，输出 {"reply":false,"daze_time":秒数}。'
                     "positive 和 excitement 必须在 -1 到 1 之间。不要输出分析或代码块。"
                 ),

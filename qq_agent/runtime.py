@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 from qq_agent.agent import HumanlikeAgent
 from qq_agent.config import Settings
 from qq_agent.onebot import OneBotPrivateBot
+from qq_agent.turns import TurnCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +85,19 @@ class QQAgentRuntime:
                 async with send_lock:
                     await websocket.send(json.dumps(action, ensure_ascii=False))
 
+            async def send_private(user_id: int, text: str) -> None:
+                await send_action({
+                    "action": "send_private_msg",
+                    "params": {"user_id": user_id, "message": text},
+                })
+
+            coordinator = TurnCoordinator(self.agent, send_private)
             bot = OneBotPrivateBot(
                 self.agent,
                 self_id=self.settings.qq_self_id,
                 send_action=send_action,
                 allowed_users=self.settings.allowed_qq_users,
+                handle_message=coordinator.handle_message,
             )
             tasks: set[asyncio.Task] = set()
             try:

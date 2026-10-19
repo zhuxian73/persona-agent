@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Awaitable, Callable, Protocol
 
 
 class Agent(Protocol):
     """传输层所需的最小接口；返回 None 表示本次保持沉默。"""
 
-    async def reply(self, user_id: int, text: str) -> str | None: ...
+    async def reply(self, user_id: int, text: str) -> str | list[str] | None: ...
 
 
 SendAction = Callable[[dict], Awaitable[None]]
@@ -49,25 +50,43 @@ class OneBotPrivateBot:
         self_id: int,
         send_action: SendAction,
         allowed_users: frozenset[int] = frozenset(),
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        handle_message: Callable[[int, str], Awaitable[None]] | None = None,
     ) -> None:
         self._agent = agent
         self._self_id = self_id
         self._send_action = send_action
         self._allowed_users = allowed_users
+        self._sleep = sleep
+        self._handle_message = handle_message
+        self._user_locks: dict[int, asyncio.Lock] = {}
 
     async def handle_event(self, event: dict) -> None:
-        """过滤事件与白名单，仅在 Agent 返回文本时发送私聊回复。"""
+        """过滤事件与白名单，按用户串行完成生成和整组消息发送。"""
         incoming = private_text_from_event(event, self._self_id)
         if incoming is None:
             return
         user_id, text = incoming
         if self._allowed_users and user_id not in self._allowed_users:
             return
-        reply = await self._agent.reply(user_id, text)
-        if reply:
-            await self._send_action(
-                {
-                    "action": "send_private_msg",
-                    "params": {"user_id": user_id, "message": reply},
-                }
-            )
+        # 运行入口可注入输入调度；过滤始终先于收集和模型调用。
+        if self._handle_message is not None:
+            await self._handle_message(user_id, text)
+            return
+        # 锁覆盖生成与发送，防止同一用户的下一组回复插入当前分段中。
+        lock = self._user_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            reply = await self._agent.reply(user_id, text)
+            if not reply:
+                return
+            messages = [reply] if isinstance(reply, str) else reply
+            for index, message in enumerate(messages):
+                # 首条立即发送，仅在两条消息之间停顿，不阻塞其他用户。
+                if index:
+                    await self._sleep(0.8)
+                await self._send_action(
+                    {
+                        "action": "send_private_msg",
+                        "params": {"user_id": user_id, "message": message},
+                    }
+                )

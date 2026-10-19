@@ -166,3 +166,77 @@ async def test_agent_preserves_mood_and_limits_history_including_silence():
     assert "answer-three" in prompts[3][1]["content"]
     for messages in prompts[1:]:
         assert "积极[-1,1]=0.4/激动[-1,1]=-0.2" in messages[1]["content"]
+
+
+def test_parse_multiple_messages_preserves_semantic_boundaries():
+    parsed = parse_ai_response(json.dumps({
+        "reply": True, "messages": [" first. Still first! ", " ", "second"],
+        "positive": 0.3,
+    }))
+
+    assert parsed.messages == ("first. Still first!", "second")
+    assert parsed.text == "first. Still first!\nsecond"
+    assert parsed.positive == 0.3
+
+
+def test_parse_merges_overflow_into_fourth_message_without_losing_text():
+    parsed = parse_ai_response(
+        '{"reply":true,"messages":["one","two","three","four","five","six"]}'
+    )
+
+    assert parsed.messages == ("one", "two", "three", "four\nfive\nsix")
+
+
+@pytest.mark.parametrize("messages", [[], [" ", ""], "hello", None, ["ok", 123]])
+def test_reply_rejects_invalid_message_lists(messages):
+    with pytest.raises(ValueError, match="messages"):
+        parse_ai_response(json.dumps({"reply": True, "messages": messages}))
+
+
+@pytest.mark.asyncio
+async def test_agent_returns_message_list_and_remembers_all_parts():
+    prompts = []
+
+    async def generate(messages):
+        prompts.append(messages)
+        return '{"reply":true,"messages":["first","second"],"positive":0.5}'
+
+    agent = HumanlikeAgent(generate)
+    assert await agent.reply(123, "hello") == ["first", "second"]
+    await agent.reply(123, "again")
+    assert "first\nsecond" in prompts[1][1]["content"]
+    assert "积极[-1,1]=0.5" in prompts[1][1]["content"]
+
+
+def test_parse_wait_is_distinct_from_silence():
+    result = parse_ai_response('{"action":"wait","wait_seconds":1.5}')
+    assert result.wait_seconds == 1.5
+    assert result.reply is False
+    assert parse_ai_response('{"reply":false}').wait_seconds is None
+
+
+@pytest.mark.parametrize("value", [None, "bad", -1, 0, float("inf"), float("nan")])
+def test_wait_rejects_invalid_delays(value):
+    with pytest.raises(ValueError, match="wait_seconds"):
+        parse_ai_response(json.dumps({"action": "wait", "wait_seconds": value}))
+
+
+@pytest.mark.asyncio
+async def test_decisions_do_not_commit_unsent_replies():
+    prompts = []
+
+    async def generate(messages):
+        prompts.append(messages[-1]["content"])
+        return '{"reply":true,"messages":["sent-part","unsent-part"],"positive":0.5}'
+
+    agent = HumanlikeAgent(generate)
+    decision = await agent.decide(123, "first")
+    await agent.decide(123, "second")
+    assert "first" not in prompts[1]
+    assert "sent-part" not in prompts[1]
+    agent.remember(123, "first", decision, ["sent-part"])
+    await agent.decide(123, "third", allow_wait=False)
+    assert "first" in prompts[2]
+    assert "sent-part" in prompts[2]
+    assert "unsent-part" not in prompts[2]
+    assert "积极[-1,1]=0.5" in prompts[2]
